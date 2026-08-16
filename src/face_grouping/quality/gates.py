@@ -34,6 +34,8 @@ class QualityResult:
     hard_excluded: bool
     hard_exclusion_reason: str  # empty string if not excluded
     exemplar_eligible: bool
+    recognition_restricted: bool = False
+    recognition_restriction_reason: str = ""
 
 
 def compute_face_quality(
@@ -73,17 +75,30 @@ def compute_face_quality(
     # regardless of how the combined score looks -- a good blur/size
     # score should never compensate for an unusable extreme-profile pose,
     # and vice versa.
-    hard_excluded = False
+    fails_quality_floor = quality_score < cfg["hard_exclusion_threshold"]
+    fails_size_floor = face_height_px <= cfg["size_hard_floor_px"]
+    fails_pose_floor = abs(yaw_ratio) >= cfg["max_yaw_ratio"]
+
+    hard_excluded = fails_quality_floor or fails_size_floor or fails_pose_floor
     reason = ""
-    if quality_score < cfg["hard_exclusion_threshold"]:
-        hard_excluded = True
+    if fails_quality_floor:
         reason = f"quality_score {quality_score:.3f} below threshold"
-    elif face_height_px <= cfg["size_hard_floor_px"]:
-        hard_excluded = True
+    elif fails_size_floor:
         reason = f"face height {face_height_px:.0f}px at/below hard floor"
-    elif abs(yaw_ratio) >= cfg["max_yaw_ratio"]:
-        hard_excluded = True
+    elif fails_pose_floor:
         reason = f"yaw_ratio {yaw_ratio:.2f} at/beyond absolute pose floor"
+
+    # A pose-only hard exclusion is special: the face is unsafe as a cluster
+    # seed/exemplar, but may still be recognizable against a mature identity.
+    # Production therefore persists an embedding for later restricted
+    # consolidation instead of discarding it. Any simultaneous size/overall-
+    # quality failure remains a true hard exclusion and is discarded.
+    recognition_restricted = bool(
+        fails_pose_floor and not fails_quality_floor and not fails_size_floor
+    )
+    recognition_restriction_reason = (
+        "pose_floor_only" if recognition_restricted else ""
+    )
 
     # --- Exemplar eligibility gate (Point 2) ---
     exemplar_eligible = (not hard_excluded) and (
@@ -101,4 +116,6 @@ def compute_face_quality(
         hard_excluded=hard_excluded,
         hard_exclusion_reason=reason,
         exemplar_eligible=exemplar_eligible,
+        recognition_restricted=recognition_restricted,
+        recognition_restriction_reason=recognition_restriction_reason,
     )

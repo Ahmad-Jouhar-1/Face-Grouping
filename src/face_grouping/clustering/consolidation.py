@@ -58,6 +58,8 @@ class ConsolidationEngine:
         exemplar_quality_threshold: float,
         exemplar_quality_bucket_size: int,
         exemplar_pose_bucket_size: int,
+        restricted_pose_recovery_enabled: bool = True,
+        restricted_pose_mature_cluster_min_faces: int = 8,
         auto_correction_enabled: bool = True,
         auto_correction_max_actions: int = 12,
         # ``small_fragment_max_faces`` is accepted only for backward
@@ -83,6 +85,10 @@ class ConsolidationEngine:
         self.exemplar_quality_threshold = exemplar_quality_threshold
         self.exemplar_quality_bucket_size = exemplar_quality_bucket_size
         self.exemplar_pose_bucket_size = exemplar_pose_bucket_size
+        self.restricted_pose_recovery_enabled = bool(restricted_pose_recovery_enabled)
+        self.restricted_pose_mature_cluster_min_faces = max(2, int(
+            restricted_pose_mature_cluster_min_faces
+        ))
         self.auto_correction_enabled = bool(auto_correction_enabled)
         self.auto_correction_max_actions = max(0, int(auto_correction_max_actions))
         # Kept only so older construction code does not break. It no longer
@@ -116,7 +122,10 @@ class ConsolidationEngine:
             self.store.load_faces_by_assignment_state(AssignmentState.AMBIGUOUS)
             + self.store.load_faces_by_assignment_state(AssignmentState.UNASSIGNED)
         )
-        deferred = [f for f in deferred if not f.is_manually_corrected]
+        deferred = [
+            f for f in deferred
+            if not f.is_manually_corrected and not f.recognition_restricted
+        ]
 
         confirmed_by_photo = defaultdict(set)
         for cluster in active_clusters:
@@ -187,6 +196,261 @@ class ConsolidationEngine:
         }
 
     # ------------------------------------------------------------------
+    # Recognition-only recovery for pose-floor faces
+    # ------------------------------------------------------------------
+
+    def _authoritative_member_count(self, cluster_id: str) -> int:
+        """Count members allowed to establish identity maturity.
+
+        Recognition-restricted faces are intentionally excluded: they may be
+        recognized *by* a mature cluster, but cannot make a cluster mature or
+        strengthen later structural decisions.
+        """
+        return sum(
+            1
+            for face in self.store.load_faces_by_cluster(cluster_id)
+            if face.assignment_state in (AssignmentState.CONFIRMED, AssignmentState.MANUAL)
+            and not face.recognition_restricted
+        )
+
+    def _evaluate_restricted_pose_face(
+        self,
+        face: Face,
+        active_clusters: Sequence[Cluster],
+        *,
+        excluded_cluster_ids: Optional[set] = None,
+    ) -> AssignmentDecision:
+        """Evaluate one pose-restricted face without allowing identity creation.
+
+        The score floor reuses the existing high-confidence sparse-cluster
+        threshold ``t_match + sparse_cluster_margin``. The winning target must
+        already be mature and have a normal Top-K exemplar representation. A
+        close second-best cluster blocks recognition exactly as in incremental
+        matching.
+        """
+        candidates = self.assigner.score_clusters(
+            face,
+            active_clusters,
+            excluded_cluster_ids=set(excluded_cluster_ids or ()),
+        )
+        if not candidates:
+            return AssignmentDecision(
+                state=AssignmentState.UNASSIGNED,
+                assigned_cluster_id=None,
+                candidate_cluster_id=None,
+                best_score=None,
+                second_best_cluster_id=None,
+                second_best_score=None,
+                score_margin=None,
+                decision_threshold=self.t_match + self.sparse_cluster_margin,
+                reason="restricted_pose_no_available_cluster",
+                create_new_cluster=False,
+            )
+
+        best = candidates[0]
+        second = candidates[1] if len(candidates) > 1 else None
+        margin = best.score - second.score if second is not None else None
+        high_conf_floor = max(
+            best.effective_threshold,
+            self.t_match + self.sparse_cluster_margin,
+        )
+        target = next(
+            (cluster for cluster in active_clusters if cluster.cluster_id == best.cluster_id),
+            None,
+        )
+        authoritative_count = (
+            self._authoritative_member_count(best.cluster_id) if target is not None else 0
+        )
+        target_is_mature = bool(
+            target is not None
+            and authoritative_count >= self.restricted_pose_mature_cluster_min_faces
+            and len(target.exemplar_set.all_exemplars()) >= self.top_k
+        )
+
+        common = dict(
+            candidate_cluster_id=best.cluster_id,
+            best_score=best.score,
+            second_best_cluster_id=second.cluster_id if second is not None else None,
+            second_best_score=second.score if second is not None else None,
+            score_margin=margin,
+            decision_threshold=high_conf_floor,
+            create_new_cluster=False,
+        )
+
+        if best.score < high_conf_floor:
+            return AssignmentDecision(
+                state=AssignmentState.UNASSIGNED,
+                assigned_cluster_id=None,
+                reason="restricted_pose_score_below_high_confidence_floor",
+                **common,
+            )
+
+        if not target_is_mature:
+            return AssignmentDecision(
+                state=AssignmentState.AMBIGUOUS,
+                assigned_cluster_id=None,
+                reason="restricted_pose_best_cluster_not_mature",
+                **common,
+            )
+
+        if second is not None and margin is not None and margin < self.min_cluster_margin:
+            return AssignmentDecision(
+                state=AssignmentState.AMBIGUOUS,
+                assigned_cluster_id=None,
+                reason="restricted_pose_insufficient_margin_over_second_best",
+                **common,
+            )
+
+        return AssignmentDecision(
+            state=AssignmentState.CONFIRMED,
+            assigned_cluster_id=best.cluster_id,
+            reason="restricted_pose_mature_cluster_high_confidence_match",
+            **common,
+        )
+
+    def recover_restricted_pose_faces(self) -> Dict[str, int]:
+        """Recover pose-only hard exclusions against mature existing people.
+
+        These faces are never permitted to create a person, join HDBSCAN new-
+        person discovery, or become exemplars. Decisions are computed from one
+        immutable cluster snapshot, then applied. If two restricted faces from
+        the same photo would both join the same identity, only the stronger one
+        is accepted and the other remains ambiguous to preserve same-photo
+        cannot-link semantics.
+        """
+        restricted = []
+        for state in (AssignmentState.UNASSIGNED, AssignmentState.AMBIGUOUS):
+            restricted.extend(
+                face
+                for face in self.store.load_faces_by_assignment_state(state)
+                if face.recognition_restricted and not face.is_manually_corrected
+            )
+        # Defensive de-duplication if a caller/store ever returns overlap.
+        restricted = list({face.face_id: face for face in restricted}.values())
+        if not self.restricted_pose_recovery_enabled or not restricted:
+            return {
+                "restricted_pose_checked": 0 if not self.restricted_pose_recovery_enabled else len(restricted),
+                "restricted_pose_recovered_confirmed": 0,
+                "remaining_restricted_pose": len(restricted),
+                "restricted_pose_ambiguous": sum(
+                    face.assignment_state == AssignmentState.AMBIGUOUS for face in restricted
+                ),
+                "restricted_pose_unassigned": sum(
+                    face.assignment_state == AssignmentState.UNASSIGNED for face in restricted
+                ),
+            }
+
+        active_clusters = self.store.load_all_clusters(include_merged=False)
+        confirmed_by_photo = defaultdict(set)
+        for cluster in active_clusters:
+            for member in self.store.load_faces_by_cluster(cluster.cluster_id):
+                if (
+                    member.photo_id is not None
+                    and member.assignment_state in (AssignmentState.CONFIRMED, AssignmentState.MANUAL)
+                ):
+                    confirmed_by_photo[member.photo_id].add(cluster.cluster_id)
+
+        evaluated: List[Tuple[Face, AssignmentDecision]] = []
+        for face in restricted:
+            decision = self._evaluate_restricted_pose_face(
+                face,
+                active_clusters,
+                excluded_cluster_ids=(
+                    confirmed_by_photo.get(face.photo_id, set())
+                    if face.photo_id is not None else set()
+                ),
+            )
+            evaluated.append((face, decision))
+
+        # Prevent two deferred faces from this same photo from being assigned
+        # to the same cluster in the same immutable-snapshot pass.
+        winners: Dict[Tuple[str, str], str] = {}
+        for face, decision in sorted(
+            evaluated,
+            key=lambda item: (
+                -(item[1].best_score if item[1].best_score is not None else float("-inf")),
+                -(item[1].score_margin if item[1].score_margin is not None else float("-inf")),
+                item[0].face_id,
+            ),
+        ):
+            if (
+                decision.state != AssignmentState.CONFIRMED
+                or not decision.assigned_cluster_id
+                or face.photo_id is None
+            ):
+                continue
+            key = (face.photo_id, decision.assigned_cluster_id)
+            if key not in winners:
+                winners[key] = face.face_id
+
+        normalized: List[Tuple[Face, AssignmentDecision]] = []
+        for face, decision in evaluated:
+            if (
+                decision.state == AssignmentState.CONFIRMED
+                and decision.assigned_cluster_id
+                and face.photo_id is not None
+                and winners.get((face.photo_id, decision.assigned_cluster_id)) != face.face_id
+            ):
+                decision = AssignmentDecision(
+                    state=AssignmentState.AMBIGUOUS,
+                    assigned_cluster_id=None,
+                    candidate_cluster_id=decision.candidate_cluster_id,
+                    best_score=decision.best_score,
+                    second_best_cluster_id=decision.second_best_cluster_id,
+                    second_best_score=decision.second_best_score,
+                    score_margin=decision.score_margin,
+                    decision_threshold=decision.decision_threshold,
+                    reason="restricted_pose_same_photo_deferred_conflict",
+                    create_new_cluster=False,
+                )
+            normalized.append((face, decision))
+
+        cluster_map = {cluster.cluster_id: cluster for cluster in active_clusters}
+        recovered_by_cluster: Dict[str, List[Face]] = defaultdict(list)
+        ambiguous = 0
+        unassigned = 0
+
+        for face, decision in normalized:
+            self.assigner.copy_decision_metadata(face, decision)
+            if (
+                decision.state == AssignmentState.CONFIRMED
+                and decision.assigned_cluster_id in cluster_map
+            ):
+                face.cluster_id = decision.assigned_cluster_id
+                face.decision_reason = f"restricted_pose_recovery:{decision.reason}"
+                recovered_by_cluster[decision.assigned_cluster_id].append(face)
+            else:
+                face.cluster_id = None
+                face.decision_reason = f"restricted_pose_recheck:{decision.reason}"
+                if face.assignment_state == AssignmentState.AMBIGUOUS:
+                    ambiguous += 1
+                else:
+                    unassigned += 1
+                self.store.save_face(face)
+
+        recovered = 0
+        now = datetime.utcnow()
+        for cluster_id, faces in recovered_by_cluster.items():
+            cluster = cluster_map[cluster_id]
+            cluster.last_updated_at = now
+            self.store.save_cluster(cluster)
+            for face in faces:
+                # Critical invariant: recognition-restricted members never
+                # enter the exemplar set, even if their numeric quality score
+                # is otherwise high.
+                self.store.save_face(face)
+            cluster.face_count = self.store.recompute_cluster_face_count(cluster_id)
+            recovered += len(faces)
+
+        return {
+            "restricted_pose_checked": len(normalized),
+            "restricted_pose_recovered_confirmed": recovered,
+            "remaining_restricted_pose": ambiguous + unassigned,
+            "restricted_pose_ambiguous": ambiguous,
+            "restricted_pose_unassigned": unassigned,
+        }
+
+    # ------------------------------------------------------------------
     # New-person discovery from still-unassigned faces
     # ------------------------------------------------------------------
 
@@ -194,7 +458,7 @@ class ConsolidationEngine:
         unassigned = [
             face
             for face in self.store.load_faces_by_assignment_state(AssignmentState.UNASSIGNED)
-            if not face.is_manually_corrected
+            if not face.is_manually_corrected and not face.recognition_restricted
         ]
         unique = {face.face_id: face for face in unassigned}
         faces = list(unique.values())
@@ -352,6 +616,7 @@ class ConsolidationEngine:
                 face
                 for face in self.store.load_faces_by_cluster(cluster.cluster_id)
                 if not face.is_manually_corrected
+                and not face.recognition_restricted
                 and face.assignment_state in (AssignmentState.CONFIRMED, AssignmentState.MANUAL)
             ]
             for cluster in clusters
@@ -1110,6 +1375,7 @@ class ConsolidationEngine:
             all_members = [
                 face for face in self.store.load_faces_by_cluster(cluster.cluster_id)
                 if face.assignment_state in (AssignmentState.CONFIRMED, AssignmentState.MANUAL)
+                and not face.recognition_restricted
             ]
             if len(all_members) < 4:
                 continue

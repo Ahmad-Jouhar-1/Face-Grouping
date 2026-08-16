@@ -112,6 +112,14 @@ matching:
 # the calibrated matching thresholds above; this section only controls when
 # the consolidation engine is allowed to act automatically.
 consolidation:
+  # Pose-only hard exclusions are persisted but can only be recognized during
+  # consolidation against a mature existing cluster. Similarity/margin floors
+  # reuse the calibrated matching values; no new face-similarity threshold is
+  # introduced here.
+  restricted_pose_recovery:
+    enabled: true
+    mature_cluster_min_faces: 8
+
   auto_correction:
     enabled: true
     max_actions_per_run: 12

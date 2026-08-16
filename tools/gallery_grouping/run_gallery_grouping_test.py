@@ -309,6 +309,8 @@ def _collect_face_assignment_rows(
                     "score_margin": _optional_float(face.score_margin),
                     "decision_threshold": _optional_float(face.decision_threshold),
                     "decision_reason": face.decision_reason or "",
+                    "recognition_restricted": bool(face.recognition_restricted),
+                    "recognition_restriction_reason": face.recognition_restriction_reason or "",
                     "quality_score": float(face.quality_score),
                     "yaw_ratio": float(face.yaw_ratio),
                     "bbox_x1": _optional_float(face.bbox_x1),
@@ -531,6 +533,7 @@ def main() -> int:
                     f"new_clusters={summary['new_clusters']}, "
                     f"auto_merges={summary.get('auto_merges', 0)}, "
                     f"auto_splits={summary.get('auto_splits', 0)}, "
+                    f"pose_recovered={summary.get('restricted_pose_recovered_confirmed', 0)}, "
                     f"merge_suggestions={summary['merge_suggestions']}, "
                     f"split_suggestions={summary['split_suggestions']}"
                 )
@@ -544,6 +547,7 @@ def main() -> int:
                 f"new_clusters={summary['new_clusters']}, "
                 f"auto_merges={summary.get('auto_merges', 0)}, "
                 f"auto_splits={summary.get('auto_splits', 0)}, "
+                f"pose_recovered={summary.get('restricted_pose_recovered_confirmed', 0)}, "
                 f"merge_suggestions={summary['merge_suggestions']}, "
                 f"split_suggestions={summary['split_suggestions']}"
             )
@@ -590,6 +594,23 @@ def main() -> int:
             "pending_split_suggestions": int(suggestion_counts.get(SuggestionType.SPLIT.value, 0)),
             "total_auto_merges": sum(int(run.get("auto_merges", 0)) for run in consolidation_runs),
             "total_auto_splits": sum(int(run.get("auto_splits", 0)) for run in consolidation_runs),
+            "total_restricted_pose_recovered": sum(
+                int(run.get("restricted_pose_recovered_confirmed", 0))
+                for run in consolidation_runs
+            ),
+            "final_recognition_restricted_faces": sum(
+                1
+                for photo in pipeline.store.load_all_photos()
+                for face in pipeline.store.load_faces_by_photo(photo.photo_id)
+                if face.recognition_restricted
+            ),
+            "final_recognition_restricted_confirmed": sum(
+                1
+                for photo in pipeline.store.load_all_photos()
+                for face in pipeline.store.load_faces_by_photo(photo.photo_id)
+                if face.recognition_restricted
+                and face.assignment_state in (AssignmentState.CONFIRMED, AssignmentState.MANUAL)
+            ),
             "final_suspicious_faces": len(suspicious_face_rows),
             "diagnostic_face_rows": len(face_assignment_rows),
             "storage_integrity_errors": storage_errors,
@@ -598,6 +619,7 @@ def main() -> int:
                 "Each person folder contains full original photos, not face crops.",
                 "A multi-person photo may correctly appear in multiple person folders.",
                 "AMBIGUOUS/UNASSIGNED faces are not forced into person folders.",
+                "Pose-only hard exclusions are persisted as recognition-restricted faces and may join only mature existing clusters during consolidation; they never seed clusters or exemplars.",
                 "Only the production high-confidence auto-correction tier is applied automatically; borderline Merge/Split suggestions remain pending for user review.",
                 "Diagnostic CSVs explain stored assignment evidence and the final audit without changing pipeline behavior.",
             ],
@@ -626,7 +648,8 @@ def main() -> int:
             "person_folder", "cluster_id", "candidate_person_folder",
             "candidate_cluster_id", "best_match_score", "second_best_person_folder",
             "second_best_cluster_id", "second_best_score", "score_margin",
-            "decision_threshold", "decision_reason", "quality_score", "yaw_ratio",
+            "decision_threshold", "decision_reason", "recognition_restricted",
+            "recognition_restriction_reason", "quality_score", "yaw_ratio",
             "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2", "detection_score",
             "is_manually_corrected",
         ],
@@ -693,6 +716,8 @@ def main() -> int:
     print(f"Confirmed/manual faces:    {state_counts.get('confirmed', 0) + state_counts.get('manual', 0)}")
     print(f"Ambiguous faces:           {state_counts.get('ambiguous', 0)}")
     print(f"Unassigned faces:          {state_counts.get('unassigned', 0)}")
+    print(f"Restricted-pose faces:     {summary_payload['final_recognition_restricted_faces']}")
+    print(f"Restricted-pose confirmed: {summary_payload['final_recognition_restricted_confirmed']}")
     print(f"Ungrouped source photos:   {summary_payload['ungrouped_photos']}")
     print(f"Processing failures:       {summary_payload['processing_failures']}")
     print(f"Storage integrity errors:  {len(summary_payload['storage_integrity_errors'])}")

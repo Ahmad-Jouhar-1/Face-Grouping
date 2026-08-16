@@ -113,7 +113,9 @@ class FaceGroupingPipeline:
         self.exemplar_quality_bucket_size = cfg["matching"]["exemplar_set"]["quality_bucket_size"]
         self.exemplar_pose_bucket_size = cfg["matching"]["exemplar_set"]["pose_bucket_size"]
         self.exemplar_quality_threshold = cfg["quality"]["exemplar_eligibility_threshold"]
-        auto_cfg = cfg.get("consolidation", {}).get("auto_correction", {})
+        consolidation_cfg = cfg.get("consolidation", {})
+        auto_cfg = consolidation_cfg.get("auto_correction", {})
+        restricted_pose_cfg = consolidation_cfg.get("restricted_pose_recovery", {})
 
         self.incremental_assigner = IncrementalAssigner(
             store=self.store,
@@ -138,6 +140,10 @@ class FaceGroupingPipeline:
             exemplar_quality_threshold=self.exemplar_quality_threshold,
             exemplar_quality_bucket_size=self.exemplar_quality_bucket_size,
             exemplar_pose_bucket_size=self.exemplar_pose_bucket_size,
+            restricted_pose_recovery_enabled=restricted_pose_cfg.get("enabled", True),
+            restricted_pose_mature_cluster_min_faces=restricted_pose_cfg.get(
+                "mature_cluster_min_faces", 8
+            ),
             auto_correction_enabled=auto_cfg.get("enabled", True),
             auto_correction_max_actions=auto_cfg.get("max_actions_per_run", 12),
             # v2 keeps the old absolute fragment-size argument only for
@@ -210,7 +216,14 @@ class FaceGroupingPipeline:
 
                 aligned = self._align_face(image_rgb, landmarks)
                 quality = self._compute_face_quality(det, landmarks, aligned)
-                if quality.hard_excluded:
+
+                # A true hard exclusion (too small / unusably low combined
+                # quality, possibly together with extreme pose) is still
+                # discarded exactly as before. A pose-ONLY exclusion is
+                # retained for recognition-only consolidation: it may later
+                # join a mature existing identity, but it cannot seed a new
+                # cluster or become an exemplar.
+                if quality.hard_excluded and not quality.recognition_restricted:
                     continue
 
                 face = Face(
@@ -229,6 +242,10 @@ class FaceGroupingPipeline:
                     detection_score=float(det.confidence),
                     embedding_model_version=self.embedding_model_version,
                     config_version=self.config_version,
+                    recognition_restricted=bool(quality.recognition_restricted),
+                    recognition_restriction_reason=(
+                        quality.recognition_restriction_reason or None
+                    ),
                 )
                 pending_faces.append((face, quality.exemplar_eligible))
 
@@ -236,6 +253,19 @@ class FaceGroupingPipeline:
                 self.store.save_photo(photo)
                 assigned_clusters_in_photo = set()
                 for face, exemplar_eligible in pending_faces:
+                    if face.recognition_restricted:
+                        face.cluster_id = None
+                        face.assignment_state = AssignmentState.UNASSIGNED
+                        face.candidate_cluster_id = None
+                        face.best_match_score = None
+                        face.second_best_cluster_id = None
+                        face.second_best_score = None
+                        face.score_margin = None
+                        face.decision_threshold = None
+                        face.decision_reason = "pose_restricted_pending_consolidation"
+                        self.store.save_face(face)
+                        continue
+
                     self._assign_face(
                         face,
                         exemplar_eligible=exemplar_eligible,
@@ -302,6 +332,11 @@ class FaceGroupingPipeline:
                 }
             )
 
+            # Pose-only restricted faces are deliberately evaluated last,
+            # against the most mature/corrected representation available in
+            # this consolidation run. They never seed clusters or exemplars.
+            restricted_pose = self.consolidation_engine.recover_restricted_pose_faces()
+
             # Suggestions are generated only from the final corrected state.
             # Anything confident enough for automation has already been acted
             # on; borderline evidence remains human-controlled.
@@ -332,6 +367,9 @@ class FaceGroupingPipeline:
             "recovered_confirmed": recovery["recovered_confirmed"] + post_recovery["recovered_confirmed"],
             "initial_recovered_confirmed": recovery["recovered_confirmed"],
             "post_correction_recovered_confirmed": post_recovery["recovered_confirmed"],
+            "restricted_pose_checked": restricted_pose["restricted_pose_checked"],
+            "restricted_pose_recovered_confirmed": restricted_pose["restricted_pose_recovered_confirmed"],
+            "remaining_restricted_pose": restricted_pose["remaining_restricted_pose"],
             "auto_merges": auto["auto_merges"],
             "auto_splits": auto["auto_splits"],
             "auto_correction_actions": auto["auto_correction_actions"],

@@ -137,6 +137,9 @@ class FaceGroupingStore:
             "detection_score": "REAL",
             "embedding_model_version": "TEXT NOT NULL DEFAULT 'legacy_unknown'",
             "config_version": "TEXT NOT NULL DEFAULT 'legacy_unknown'",
+            # Stage 5: pose-only recognition-restricted faces.
+            "recognition_restricted": "INTEGER NOT NULL DEFAULT 0",
+            "recognition_restriction_reason": "TEXT",
         }
         assignment_state_was_added = "assignment_state" not in existing
         for column, definition in additions.items():
@@ -294,8 +297,9 @@ class FaceGroupingStore:
                  second_best_cluster_id, second_best_score, score_margin,
                  decision_threshold, decision_reason, photo_id, face_index,
                  bbox_x1, bbox_y1, bbox_x2, bbox_y2, detection_score,
-                 embedding_model_version, config_version)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 embedding_model_version, config_version, recognition_restricted,
+                 recognition_restriction_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(face_id) DO UPDATE SET
                 embedding=excluded.embedding,
                 quality_score=excluded.quality_score,
@@ -318,7 +322,9 @@ class FaceGroupingStore:
                 bbox_y2=excluded.bbox_y2,
                 detection_score=excluded.detection_score,
                 embedding_model_version=excluded.embedding_model_version,
-                config_version=excluded.config_version
+                config_version=excluded.config_version,
+                recognition_restricted=excluded.recognition_restricted,
+                recognition_restriction_reason=excluded.recognition_restriction_reason
             """,
             (
                 face.face_id,
@@ -345,6 +351,8 @@ class FaceGroupingStore:
                 face.detection_score,
                 face.embedding_model_version,
                 face.config_version,
+                int(face.recognition_restricted),
+                face.recognition_restriction_reason,
             ),
         )
         self._commit_if_needed()
@@ -459,7 +467,10 @@ class FaceGroupingStore:
             face.decision_reason = "manual_correction"
             self.save_face(face)
 
-            if face.quality_score >= exemplar_quality_threshold:
+            if (
+                face.quality_score >= exemplar_quality_threshold
+                and not face.recognition_restricted
+            ):
                 target.exemplar_set.try_add(
                     Exemplar(
                         embedding=face.embedding,
@@ -505,6 +516,8 @@ class FaceGroupingStore:
             detection_score=row["detection_score"],
             embedding_model_version=row["embedding_model_version"],
             config_version=row["config_version"],
+            recognition_restricted=bool(row["recognition_restricted"]),
+            recognition_restriction_reason=row["recognition_restriction_reason"],
         )
 
     # ------------------------------------------------------------------
@@ -693,7 +706,11 @@ class FaceGroupingStore:
         cluster = self.load_cluster(cluster_id)
         if cluster is not None and len(cluster.exemplar_set) == 0:
             eligible = sorted(
-                (face for face in faces if face.quality_score >= exemplar_quality_threshold),
+                (
+                    face for face in faces
+                    if face.quality_score >= exemplar_quality_threshold
+                    and not face.recognition_restricted
+                ),
                 key=lambda face: face.quality_score,
                 reverse=True,
             )
@@ -868,7 +885,10 @@ class FaceGroupingStore:
             self._conn.execute("DELETE FROM exemplars WHERE cluster_id=?", (cluster_id,))
             self._conn.execute("DELETE FROM clusters WHERE cluster_id=?", (cluster_id,))
             return
-        eligible = [f for f in faces if f.quality_score >= exemplar_quality_threshold]
+        eligible = [
+            f for f in faces
+            if f.quality_score >= exemplar_quality_threshold and not f.recognition_restricted
+        ]
         if not eligible and allow_low_quality_seed:
             eligible = [max(faces, key=lambda f: f.quality_score)]
         if not eligible:
@@ -1018,14 +1038,20 @@ class FaceGroupingStore:
                 face for face in self.load_faces_by_cluster(source_cluster_id)
                 if face.assignment_state in (AssignmentState.CONFIRMED, AssignmentState.MANUAL)
             ]
-            current_ids = {f.face_id for f in current_faces}
+            restricted_faces = [f for f in current_faces if f.recognition_restricted]
+            authoritative_faces = [f for f in current_faces if not f.recognition_restricted]
+            current_ids = {f.face_id for f in authoritative_faces}
             if set(flat) != current_ids:
-                raise ValueError("STALE: split membership changed after suggestion creation")
-            by_id = {f.face_id: f for f in current_faces}
+                raise ValueError("STALE: split authoritative membership changed after suggestion creation")
+            by_id = {f.face_id: f for f in authoritative_faces}
             if any(f.is_manually_corrected for f in current_faces):
                 raise ValueError("Split blocked because the cluster contains manual corrections")
             for group in normalized:
-                if not any(by_id[fid].quality_score >= exemplar_quality_threshold for fid in group):
+                if not any(
+                    by_id[fid].quality_score >= exemplar_quality_threshold
+                    and not by_id[fid].recognition_restricted
+                    for fid in group
+                ):
                     raise ValueError("Split group has no exemplar-eligible face")
 
             retained = sorted(normalized, key=lambda g: (-len(g), g))[0]
@@ -1042,6 +1068,23 @@ class FaceGroupingStore:
             source.last_updated_at = datetime.utcnow()
             self.save_cluster(new_cluster)
             self.save_cluster(source)
+
+            # Restricted-pose members are deliberately non-authoritative. A
+            # structural split invalidates their prior recognition context, so
+            # detach them and let the next restricted-pose recovery pass decide
+            # which resulting mature identity, if any, they belong to.
+            for restricted in restricted_faces:
+                restricted.cluster_id = None
+                restricted.assignment_state = AssignmentState.UNASSIGNED
+                restricted.candidate_cluster_id = None
+                restricted.best_match_score = None
+                restricted.second_best_cluster_id = None
+                restricted.second_best_score = None
+                restricted.score_margin = None
+                restricted.decision_threshold = None
+                restricted.decision_reason = "restricted_pose_recheck_after_split"
+                self.save_face(restricted)
+
             placeholders = ",".join("?" for _ in new_group)
             self._conn.execute(
                 f"UPDATE faces SET cluster_id=?, candidate_cluster_id=? WHERE face_id IN ({placeholders})",
@@ -1327,6 +1370,7 @@ class FaceGroupingStore:
                OR f.face_id IS NULL
                OR f.cluster_id != e.cluster_id
                OR f.assignment_state NOT IN ('confirmed','manual')
+               OR COALESCE(f.recognition_restricted, 0) = 1
             """
         ).fetchall():
             errors.append(

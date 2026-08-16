@@ -1,6 +1,6 @@
 """SQLite schema for the local face-grouping persistence layer."""
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_STATEMENTS = [
     """
@@ -55,6 +55,8 @@ SCHEMA_STATEMENTS = [
         detection_score REAL,
         embedding_model_version TEXT NOT NULL DEFAULT 'legacy_unknown',
         config_version TEXT NOT NULL DEFAULT 'legacy_unknown',
+        recognition_restricted INTEGER NOT NULL DEFAULT 0,
+        recognition_restriction_reason TEXT,
         FOREIGN KEY (cluster_id) REFERENCES clusters(cluster_id),
         FOREIGN KEY (photo_id) REFERENCES photos(photo_id),
         UNIQUE(photo_id, face_index)

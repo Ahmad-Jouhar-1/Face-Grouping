@@ -64,6 +64,12 @@ class Face:
     embedding_model_version: str = "legacy_unknown"
     config_version: str = "legacy_unknown"
 
+    # Faces rejected only by the absolute pose floor are retained for a
+    # restricted recognition-only path. They can join a mature existing
+    # cluster, but can never seed a cluster or become an exemplar.
+    recognition_restricted: bool = False
+    recognition_restriction_reason: Optional[str] = None
+
     def __post_init__(self):
         if isinstance(self.assignment_state, str):
             self.assignment_state = AssignmentState(self.assignment_state)
