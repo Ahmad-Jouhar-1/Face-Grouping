@@ -15,3 +15,12 @@ data/
 .idea/
 .DS_Store
 Thumbs.db
+# Local runtime / packaging artifacts
+.env
+*.db
+*.sqlite
+*.sqlite3
+.pytest_cache/
+*.egg-info/
+build/
+dist/

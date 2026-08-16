@@ -1,6 +1,7 @@
 """Incremental cluster scoring, decision, and persistence application."""
 import uuid
 from datetime import datetime
+from face_grouping.time_utils import utcnow_naive
 from typing import Iterable, List, Optional, Set
 
 from face_grouping.clustering.data_types import Cluster, Face
@@ -122,7 +123,7 @@ class IncrementalAssigner:
         excluded_cluster_ids: Optional[Set[str]] = None,
     ) -> AssignmentDecision:
         with self.store.transaction():
-            now = datetime.utcnow()
+            now = utcnow_naive()
             active_clusters = self.store.load_all_clusters(include_merged=False)
             decision = self.evaluate_face(
                 face,

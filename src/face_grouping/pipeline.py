@@ -6,9 +6,9 @@ Wires Steps 1-7 into one continuous flow:
   known people (Step 4) -> assign to a cluster or create a new one
   -> persist (Step 7)
 
-Plus on-demand (not scheduled -- Points 12-14 remain explicitly out of
-scope): consolidation (Step 5), merge/split suggestion resolution, and
-correction application (Step 6).
+Plus explicit consolidation (Step 5), merge/split suggestion resolution, and
+correction application (Step 6). Production cadence/leases live in the
+application/storage layers so the core algorithm remains transport-neutral.
 
 Two documented simplifications vs. the original locked design:
 
@@ -26,14 +26,13 @@ Two documented simplifications vs. the original locked design:
 """
 import uuid
 from datetime import datetime
+from face_grouping.time_utils import utcnow_naive
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import cv2
 import numpy as np
 
-from face_grouping.embedding.embedder import EmbedderWrapper
-from face_grouping.matching.thresholds import load_match_thresholds
 from face_grouping.matching.assignment import AssignmentState
 from face_grouping.matching.incremental import IncrementalAssigner
 from face_grouping.clustering.data_types import (
@@ -49,10 +48,10 @@ from face_grouping.clustering.merge_rules import (
 from face_grouping.lifecycle.visibility import get_visibility, VisibilityState
 from face_grouping.lifecycle.pruning import find_clusters_to_prune
 from face_grouping.storage.store import FaceGroupingStore
-from face_grouping.config import (
-    load_thresholds, load_model_paths, get_embedding_model_version,
-    get_config_version, normalize_image_path,
-)
+from face_grouping.storage.schema import LEGACY_USER_ID
+from face_grouping.runtime import FaceGroupingRuntime
+from face_grouping.config import normalize_image_path
+from face_grouping.errors import PhotoProcessingInProgressError, PhotoProcessingLeaseLostError
 
 
 def _read_image_bgr(image_path: str):
@@ -75,43 +74,50 @@ def _read_image_bgr(image_path: str):
 
 
 class FaceGroupingPipeline:
-    def __init__(self, db_path: str):
-        # Keep heavy MediaPipe imports inside runtime construction so storage
-        # and transaction tests do not require model dependencies.
-        from face_grouping.detection.detector import FaceDetectorWrapper
-        from face_grouping.detection.landmarker import FaceLandmarkerWrapper
-        from face_grouping.alignment.aligner import align_face
-        from face_grouping.quality.gates import compute_face_quality
+    """One tenant-scoped grouping session backed by a shared model runtime."""
 
-        self._align_face = align_face
-        self._compute_face_quality = compute_face_quality
-        model_paths = load_model_paths()
-        cfg = load_thresholds()
+    def __init__(
+        self,
+        db_path: str,
+        user_id: str = LEGACY_USER_ID,
+        *,
+        runtime: Optional[FaceGroupingRuntime] = None,
+        photo_processing_lease_seconds: int = 300,
+    ):
+        self.runtime = runtime or FaceGroupingRuntime()
+        self._owns_runtime = runtime is None
+        self.user_id = user_id
+        self.photo_processing_lease_seconds = int(photo_processing_lease_seconds)
+        if self.photo_processing_lease_seconds < 0:
+            raise ValueError("photo_processing_lease_seconds must be >= 0")
 
-        self.embedding_model_version = get_embedding_model_version()
-        self.config_version = get_config_version()
-        self.detector = FaceDetectorWrapper(
-            model_paths["mediapipe"]["face_detector"],
-            confidence_threshold=cfg["detection"]["confidence_threshold"],
-        )
-        self.landmarker = FaceLandmarkerWrapper(model_paths["mediapipe"]["face_landmarker"])
-        self.embedder = EmbedderWrapper(model_paths["embedding"]["weights"])
-        self.store = FaceGroupingStore(db_path)
+        self._align_face = self.runtime.align_face
+        self._compute_face_quality = self.runtime.compute_face_quality
+        self.detector = self.runtime.detector
+        self.landmarker = self.runtime.landmarker
+        self.embedder = self.runtime.embedder
+        self.embedding_model_version = self.runtime.embedding_model_version
+        self.config_version = self.runtime.config_version
+        cfg = self.runtime.cfg
+
+        self.store = FaceGroupingStore(db_path, user_id=user_id)
         self.legacy_empty_cluster_repair = self.store.repair_empty_active_clusters()
         self.legacy_suggestions_removed = self.store.remove_legacy_pending_suggestions()
 
-        self.t_match, self.band_width = load_match_thresholds()
-        if self.t_match is None:
+        matching_cfg = cfg["matching"]
+        self.t_match = matching_cfg.get("t_match")
+        self.band_width = matching_cfg.get("ambiguous_band_width")
+        if self.t_match is None or self.band_width is None:
             raise ValueError(
                 "T_match/ambiguous_band_width are not set in configs/thresholds.yaml. "
                 "Run the Phase 1/2 sweeps (Step 4) first."
             )
-        self.top_k = cfg["matching"]["top_k"]
-        self.sparse_cluster_margin = cfg["matching"]["sparse_cluster_margin"]
-        self.exemplar_admission_margin = cfg["matching"]["exemplar_admission_margin"]
-        self.min_cluster_margin = cfg["matching"]["min_cluster_margin"]
-        self.exemplar_quality_bucket_size = cfg["matching"]["exemplar_set"]["quality_bucket_size"]
-        self.exemplar_pose_bucket_size = cfg["matching"]["exemplar_set"]["pose_bucket_size"]
+        self.top_k = matching_cfg["top_k"]
+        self.sparse_cluster_margin = matching_cfg["sparse_cluster_margin"]
+        self.exemplar_admission_margin = matching_cfg["exemplar_admission_margin"]
+        self.min_cluster_margin = matching_cfg["min_cluster_margin"]
+        self.exemplar_quality_bucket_size = matching_cfg["exemplar_set"]["quality_bucket_size"]
+        self.exemplar_pose_bucket_size = matching_cfg["exemplar_set"]["pose_bucket_size"]
         self.exemplar_quality_threshold = cfg["quality"]["exemplar_eligibility_threshold"]
         consolidation_cfg = cfg.get("consolidation", {})
         auto_cfg = consolidation_cfg.get("auto_correction", {})
@@ -146,9 +152,6 @@ class FaceGroupingPipeline:
             ),
             auto_correction_enabled=auto_cfg.get("enabled", True),
             auto_correction_max_actions=auto_cfg.get("max_actions_per_run", 12),
-            # v2 keeps the old absolute fragment-size argument only for
-            # backward compatibility; actual fragment detection is relative
-            # to the target cluster and uses member-bridge evidence.
             small_fragment_max_faces=auto_cfg.get("small_fragment_max_faces"),
             mature_cluster_min_faces=auto_cfg.get("mature_cluster_min_faces", 8),
             fragment_max_target_ratio=auto_cfg.get("fragment_max_target_ratio", 0.35),
@@ -160,9 +163,9 @@ class FaceGroupingPipeline:
         )
 
     def close(self):
-        self.detector.close()
-        self.landmarker.close()
         self.store.close()
+        if self._owns_runtime:
+            self.runtime.close()
 
     def __enter__(self):
         return self
@@ -174,26 +177,68 @@ class FaceGroupingPipeline:
     # Photo ingestion (Steps 1-4, persisted via Step 7)
     # ------------------------------------------------------------------
 
-    def process_photo(self, image_path: str) -> List[Face]:
-        """Process one image once and persist its complete result atomically.
+    def process_photo(
+        self,
+        image_path: str,
+        *,
+        photo_id: Optional[str] = None,
+        source_ref: Optional[str] = None,
+    ) -> List[Face]:
+        faces, _ = self.process_photo_with_status(
+            image_path, photo_id=photo_id, source_ref=source_ref
+        )
+        return faces
 
-        The photo has one row; every accepted detected face has its own row and
-        may belong to a different person cluster. Repeating the same normalized
-        path returns the already stored faces instead of duplicating them.
+    def process_photo_with_status(
+        self,
+        image_path: str,
+        *,
+        photo_id: Optional[str] = None,
+        source_ref: Optional[str] = None,
+    ) -> tuple[List[Face], bool]:
+        """Process one photo with an SQLite ownership lease.
+
+        Returns ``(faces, cached)``. The lease closes the concurrent-retry race:
+        only the current token owner may commit inference results.
         """
-        normalized_path = normalize_image_path(image_path)
-        existing = self.store.get_photo_by_path(normalized_path)
-        if existing and existing.processing_status == PhotoProcessingStatus.COMPLETED:
-            return self.store.load_faces_by_photo(existing.photo_id)
+        if source_ref is not None:
+            normalized_path = source_ref.strip()
+            if not normalized_path:
+                raise ValueError("source_ref must be non-empty when provided")
+        else:
+            normalized_path = normalize_image_path(image_path)
+        existing_by_path = self.store.get_photo_by_path(normalized_path) if photo_id is None else None
+        resolved_photo_id = photo_id or (
+            existing_by_path.photo_id if existing_by_path else str(uuid.uuid4())
+        )
+
+        claim = self.store.claim_photo_processing(
+            photo_id=resolved_photo_id,
+            image_path=normalized_path,
+            embedding_model_version=self.embedding_model_version,
+            config_version=self.config_version,
+            lease_seconds=self.photo_processing_lease_seconds,
+        )
+        if claim.status == "completed":
+            return self.store.load_faces_by_photo(resolved_photo_id), True
+        if claim.status == "in_progress":
+            raise PhotoProcessingInProgressError(
+                resolved_photo_id, claim.retry_after_seconds
+            )
+        token = claim.token
+        assert token is not None
 
         image_bgr = _read_image_bgr(image_path)
         if image_bgr is None:
+            self.store.fail_photo_processing_claim(
+                resolved_photo_id, token, f"Could not read image: {image_path}"
+            )
             raise FileNotFoundError(f"Could not read image: {image_path}")
         image_height, image_width = image_bgr.shape[:2]
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
         photo = Photo(
-            photo_id=existing.photo_id if existing else str(uuid.uuid4()),
+            photo_id=resolved_photo_id,
             image_path=normalized_path,
             image_width=image_width,
             image_height=image_height,
@@ -204,52 +249,51 @@ class FaceGroupingPipeline:
 
         pending_faces = []
         try:
-            detections = self.detector.detect(image_rgb)
-            landmarks_by_detection = self.landmarker.detect_for_detections(
-                image_rgb, detections
-            )
-            for detection_index, (det, landmarks) in enumerate(
-                zip(detections, landmarks_by_detection)
-            ):
-                if landmarks is None:
-                    continue
-
-                aligned = self._align_face(image_rgb, landmarks)
-                quality = self._compute_face_quality(det, landmarks, aligned)
-
-                # A true hard exclusion (too small / unusably low combined
-                # quality, possibly together with extreme pose) is still
-                # discarded exactly as before. A pose-ONLY exclusion is
-                # retained for recognition-only consolidation: it may later
-                # join a mature existing identity, but it cannot seed a new
-                # cluster or become an exemplar.
-                if quality.hard_excluded and not quality.recognition_restricted:
-                    continue
-
-                face = Face(
-                    face_id=str(uuid.uuid4()),
-                    embedding=self.embedder.embed(aligned.image),
-                    quality_score=quality.quality_score,
-                    yaw_ratio=quality.yaw_ratio,
-                    created_at=datetime.utcnow(),
-                    assignment_state=AssignmentState.UNASSIGNED,
-                    photo_id=photo.photo_id,
-                    face_index=detection_index,
-                    bbox_x1=float(det.x),
-                    bbox_y1=float(det.y),
-                    bbox_x2=float(det.x2),
-                    bbox_y2=float(det.y2),
-                    detection_score=float(det.confidence),
-                    embedding_model_version=self.embedding_model_version,
-                    config_version=self.config_version,
-                    recognition_restricted=bool(quality.recognition_restricted),
-                    recognition_restriction_reason=(
-                        quality.recognition_restriction_reason or None
-                    ),
+            with self.runtime.inference_lock:
+                detections = self.detector.detect(image_rgb)
+                landmarks_by_detection = self.landmarker.detect_for_detections(
+                    image_rgb, detections
                 )
-                pending_faces.append((face, quality.exemplar_eligible))
+                for detection_index, (det, landmarks) in enumerate(
+                    zip(detections, landmarks_by_detection)
+                ):
+                    if landmarks is None:
+                        continue
+
+                    aligned = self._align_face(image_rgb, landmarks)
+                    quality = self._compute_face_quality(det, landmarks, aligned)
+
+                    if quality.hard_excluded and not quality.recognition_restricted:
+                        continue
+
+                    face = Face(
+                        face_id=str(uuid.uuid4()),
+                        embedding=self.embedder.embed(aligned.image),
+                        quality_score=quality.quality_score,
+                        yaw_ratio=quality.yaw_ratio,
+                        created_at=utcnow_naive(),
+                        assignment_state=AssignmentState.UNASSIGNED,
+                        photo_id=photo.photo_id,
+                        face_index=detection_index,
+                        bbox_x1=float(det.x),
+                        bbox_y1=float(det.y),
+                        bbox_x2=float(det.x2),
+                        bbox_y2=float(det.y2),
+                        detection_score=float(det.confidence),
+                        embedding_model_version=self.embedding_model_version,
+                        config_version=self.config_version,
+                        recognition_restricted=bool(quality.recognition_restricted),
+                        recognition_restriction_reason=(
+                            quality.recognition_restriction_reason or None
+                        ),
+                    )
+                    pending_faces.append((face, quality.exemplar_eligible))
 
             with self.store.transaction():
+                try:
+                    self.store.assert_photo_processing_claim(photo.photo_id, token)
+                except RuntimeError as exc:
+                    raise PhotoProcessingLeaseLostError(photo.photo_id) from exc
                 self.store.save_photo(photo)
                 assigned_clusters_in_photo = set()
                 for face, exemplar_eligible in pending_faces:
@@ -274,18 +318,17 @@ class FaceGroupingPipeline:
                     if face.cluster_id is not None:
                         assigned_clusters_in_photo.add(face.cluster_id)
                 photo.processing_status = PhotoProcessingStatus.COMPLETED
-                photo.processed_at = datetime.utcnow()
+                photo.processed_at = utcnow_naive()
                 photo.error_message = None
                 self.store.save_photo(photo)
-            return [face for face, _ in pending_faces]
+                self.store.complete_photo_processing_claim(photo.photo_id, token)
+            return [face for face, _ in pending_faces], False
+        except PhotoProcessingLeaseLostError:
+            raise
         except Exception as exc:
-            # Assignment/cluster changes were rolled back. Keep one retryable
-            # failed-photo row for diagnosis, without any partial face writes.
-            photo.processing_status = PhotoProcessingStatus.FAILED
-            photo.processed_at = datetime.utcnow()
-            photo.error_message = str(exc)[:500]
-            with self.store.transaction():
-                self.store.save_photo(photo)
+            # Only the current owner may mark failure. If the lease was already
+            # reclaimed, leave the newer worker's state untouched.
+            self.store.fail_photo_processing_claim(photo.photo_id, token, str(exc))
             raise
 
     def _assign_face(
@@ -305,8 +348,14 @@ class FaceGroupingPipeline:
     # Consolidation (Step 5) -> Suggestions (Step 6)
     # ------------------------------------------------------------------
 
-    def run_consolidation(self) -> dict:
-        """Run safe local consolidation as one atomic database operation."""
+    def run_consolidation(self, *, consolidation_token: Optional[str] = None) -> dict:
+        """Run safe local consolidation as one atomic database operation.
+
+        When a production lifecycle claim token is supplied, resetting the
+        cadence happens inside this same SQLite transaction. That prevents a
+        photo completed immediately after consolidation from being accidentally
+        erased from the next cadence window.
+        """
         with self.store.transaction():
             # Pass 1: recover deferred evidence and discover genuinely new
             # people exactly as before.
@@ -352,6 +401,9 @@ class FaceGroupingPipeline:
             remaining_unassigned = len(
                 self.store.load_faces_by_assignment_state(AssignmentState.UNASSIGNED)
             )
+
+            if consolidation_token is not None:
+                self.store.complete_consolidation_claim(consolidation_token)
 
         # Keep the original summary keys for Step-9 compatibility, while adding
         # the Stage-2 counters needed to explain what actually changed.
@@ -494,7 +546,7 @@ class FaceGroupingPipeline:
 
     def run_pruning(self, now: datetime = None) -> int:
         if now is None:
-            now = datetime.utcnow()
+            now = utcnow_naive()
         active_clusters = self.store.load_all_clusters(include_merged=False)
         to_prune = find_clusters_to_prune(active_clusters, now)
         for cluster in to_prune:

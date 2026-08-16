@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 from datetime import datetime
+from face_grouping.time_utils import utcnow_naive
 from enum import Enum
 from typing import Any, Dict, List
 
@@ -34,10 +35,10 @@ class Suggestion:
     suggestion_type: SuggestionType
     cluster_ids: List[str]
     status: SuggestionStatus = SuggestionStatus.PENDING
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow_naive)
     payload: Dict[str, Any] = field(default_factory=dict)
     evidence: Dict[str, Any] = field(default_factory=dict)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=utcnow_naive)
     resolved_at: datetime | None = None
 
 
@@ -93,6 +94,6 @@ def build_split_suggestions(split_candidates: List[SplitCandidate]) -> List[Sugg
 
 def resolve_suggestion(suggestion: Suggestion, status: SuggestionStatus) -> None:
     suggestion.status = status
-    suggestion.updated_at = datetime.utcnow()
+    suggestion.updated_at = utcnow_naive()
     if status in (SuggestionStatus.ACCEPTED, SuggestionStatus.REJECTED, SuggestionStatus.UNCERTAIN, SuggestionStatus.STALE):
         suggestion.resolved_at = suggestion.updated_at

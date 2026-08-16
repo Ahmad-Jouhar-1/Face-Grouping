@@ -13,6 +13,7 @@ is raised.
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+from face_grouping.time_utils import utcnow_naive
 from itertools import combinations
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import uuid
@@ -175,7 +176,7 @@ class ConsolidationEngine:
                     remaining_unassigned += 1
                 self.store.save_face(face)
 
-        now = datetime.utcnow()
+        now = utcnow_naive()
         recovered = 0
         for cluster_id, faces in recovered_by_cluster.items():
             cluster = cluster_map[cluster_id]
@@ -429,7 +430,7 @@ class ConsolidationEngine:
                 self.store.save_face(face)
 
         recovered = 0
-        now = datetime.utcnow()
+        now = utcnow_naive()
         for cluster_id, faces in recovered_by_cluster.items():
             cluster = cluster_map[cluster_id]
             cluster.last_updated_at = now
@@ -540,8 +541,8 @@ class ConsolidationEngine:
                     pose_bucket_size=self.exemplar_pose_bucket_size,
                 ),
                 face_count=len(group),
-                created_at=datetime.utcnow(),
-                last_updated_at=datetime.utcnow(),
+                created_at=utcnow_naive(),
+                last_updated_at=utcnow_naive(),
             )
 
             for exemplar_face in sorted(eligible, key=lambda f: f.quality_score, reverse=True):

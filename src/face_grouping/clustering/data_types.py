@@ -1,6 +1,7 @@
 """Lightweight in-memory photo, face, and cluster data structures."""
 from dataclasses import dataclass, field
 from datetime import datetime
+from face_grouping.time_utils import utcnow_naive
 from enum import Enum
 from typing import Optional
 
@@ -41,7 +42,7 @@ class Face:
     yaw_ratio: float
     cluster_id: Optional[str] = None
     is_manually_corrected: bool = False
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow_naive)
 
     # Persistent assignment evidence.
     assignment_state: Optional[AssignmentState] = None
@@ -88,6 +89,6 @@ class Cluster:
     face_count: int = 0
     is_user_confirmed: bool = False
     has_manual_correction: bool = False
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utcnow_naive)
+    last_updated_at: datetime = field(default_factory=utcnow_naive)
     merged_into: Optional[str] = None

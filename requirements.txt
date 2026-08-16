@@ -1,6 +1,18 @@
+# Face Grouping AI - single dependency/install entry point
+# Install everything with:
+#   python -m pip install -r requirements.txt
+
 torch>=2.0.0
 mediapipe>=0.10.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
 pyyaml>=6.0
 opencv-python>=4.8.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+pytest>=8.0.0
+
+# Install this repository as an editable package and expose face-grouping-api.
+-e .
