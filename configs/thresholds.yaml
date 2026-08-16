@@ -1,0 +1,145 @@
+# Single source of truth for every tunable numeric constant in the
+# face-grouping pipeline. Values here are documented starting points per
+# our locked design points -- several are explicitly marked as needing
+# empirical validation (Phase 1 / Phase 2 sweeps) before being trusted as
+# final for production use.
+
+detection:
+  confidence_threshold: 0.5  # Point 1
+
+alignment:
+  target_size: 112  # Point 3
+
+quality:
+  # Sub-score weights (Point 2) -- must sum to 1.0
+  weights:
+    size: 0.35
+    blur: 0.35
+    pose: 0.20
+    eye_openness: 0.10
+
+  # Size score normalization (Point 3)
+  size_hard_floor_px: 40      # below this: size_score = 0, and hard-excluded regardless of other scores
+  size_reliable_floor_px: 60  # Point 3's "reliable" floor
+  size_reference_px: 150      # size_score reaches 1.0 at/above this face height
+
+  # Blur score normalization (Laplacian variance on the 112x112 aligned
+  # crop -- fixed crop size means no cross-resolution normalization is
+  # needed, per Point 2's discussion). STARTING VALUE, not yet validated
+  # against Phase 1/2 data.
+  blur_reference_variance: 300.0
+
+  # Pose score (Point 2: yaw/pitch from landmarks). Only yaw is currently
+  # folded into the score; pitch is computed and logged for future
+  # calibration but not yet weighted in, since we don't have a validated
+  # frontal-baseline for pitch yet (documented simplification).
+  # max_yaw_ratio is an approximate proxy for the ~60-70 degree absolute
+  # pose floor from Point 2 -- NOT yet calibrated against real degrees.
+  max_yaw_ratio: 0.6
+
+  # Eye-openness (EAR) normalization. Typical EAR range per literature:
+  # ~0.2-0.35 open, approaching 0 when closed. STARTING VALUES.
+  ear_closed: 0.15
+  ear_open: 0.35
+
+  # Gates (Point 2)
+  hard_exclusion_threshold: 0.3
+  exemplar_eligibility_threshold: 0.7
+
+matching:
+  # Top-k exemplar score combination (Point 7)
+  top_k: 2
+
+  # Exemplar set structure (Point 6). Temporal-anchor bucket is deferred
+  # to the backend/consolidation stage (it requires long-running cluster
+  # history that doesn't exist yet at this isolated matching-module
+  # level) -- quality + pose buckets sum to the full 5-exemplar set for
+  # now: 3 quality + 2 pose = 5.
+  exemplar_set:
+    quality_bucket_size: 3
+    pose_bucket_size: 2
+
+  # Production matching values calibrated for the IR-SE50 embedding
+  # backbone. They are model-specific and must not be reused with a
+  # different embedding model without a fresh validation/calibration.
+  t_match: 0.41
+  ambiguous_band_width: 0.08
+
+  # NEW (Step 8 bugfix, not one of the original 20 locked points):
+  # a single raw pairwise comparison is noisier than a top-k average
+  # over several exemplars. Found via real end-to-end testing: a
+  # brand-new cluster with only 1 exemplar got a false-positive match
+  # from a different real person, because it was held to the exact same
+  # T_match as an established, multi-exemplar cluster. This margin
+  # raises the effective threshold specifically for clusters with fewer
+  # than `top_k` exemplars, rather than blocking them outright (which
+  # would deadlock -- a singleton cluster could never gain a 2nd photo).
+  # STARTING VALUE, empirically adjustable like every other threshold.
+  sparse_cluster_margin: 0.05
+
+  # Stage 1 incremental-assignment safety: even when the best cluster
+  # clears its effective threshold, it is not auto-assigned unless it
+  # also beats the second-best cluster by this margin. Near ties are
+  # persisted as AMBIGUOUS and cannot affect exemplars or face_count.
+  # Starting value; calibrate on real open-set identification data.
+  min_cluster_margin: 0.05
+
+  # NEW (Step 9 bugfix, not one of the original 20 locked points):
+  # cluster MEMBERSHIP and EXEMPLAR ADMISSION previously used the same
+  # threshold, despite very different stakes -- joining a cluster
+  # affects one photo, but becoming an exemplar shapes EVERY future
+  # matching decision for that cluster.
+  #
+  # Found via Step 9 end-to-end testing: a face scraping in just above
+  # T_match (0.4233 vs 0.41) immediately became an exemplar, blending
+  # two people's identities into one cluster's reference set. That
+  # blended, more permissive target then let a THIRD person match in --
+  # a cascading contamination, not a simple pairwise confusion.
+  #
+  # This margin requires a face to clear t_match + margin before it can
+  # become an exemplar. It still joins the cluster normally below that;
+  # it just doesn't get to redefine what the cluster looks like.
+  #
+  # TENSION TO MONITOR: the pose-diversity exemplar bucket (Point 6)
+  # deliberately wants *different-looking* genuine photos, which score
+  # lower by nature. Too high a margin here would starve that bucket.
+  # 0.10 is a starting value chosen to sit above the observed noise zone
+  # (~0.42-0.43) but below typical genuine within-person similarity
+  # (~0.60-0.72 observed on real data) -- empirically tunable.
+  exemplar_admission_margin: 0.10
+
+# Late-stage structural correction. Similarity decisions deliberately reuse
+# the calibrated matching thresholds above; this section only controls when
+# the consolidation engine is allowed to act automatically.
+consolidation:
+  auto_correction:
+    enabled: true
+    max_actions_per_run: 12
+
+    # Auto-correction v2: singleton clusters are deliberately excluded from
+    # automatic merge. In a phone gallery, one face may simply be a real
+    # person who appears in exactly one photo.
+
+    # A history-created fragment is defined RELATIVELY, not by an arbitrary
+    # absolute 2-4 face cap. The smaller cluster must be no more than this
+    # fraction of a mature target. Similarity evidence still reuses the
+    # calibrated matching thresholds above.
+    mature_cluster_min_faces: 8
+    fragment_max_target_ratio: 0.35
+
+    # Member-bridge reconciliation: every fragment member must have repeated
+    # support from at least this many distinct members/photos in the target.
+    # At least two source faces must independently reach the existing
+    # high-confidence and exemplar-admission-strength floors. These are
+    # evidence-count constraints, NOT new face-similarity thresholds.
+    member_bridge_min_target_support: 2
+    member_bridge_min_high_conf_source_faces: 2
+    member_bridge_min_strong_source_faces: 2
+
+    # Fully mutual auto-merge is stricter than the normal 90%/90% suggestion
+    # tier: v2 requires 100%/100% high-confidence coverage plus this many
+    # strong anchors in each direction and third-person separation.
+    mutual_auto_min_strong_anchors_per_direction: 2
+
+    # Auto-split remains intentionally stricter than a split suggestion.
+    auto_split_min_group_faces: 3

@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test/private gallery data
+data/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

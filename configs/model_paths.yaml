@@ -1,0 +1,10 @@
+mediapipe:
+  face_detector: models/mediapipe/face_detector.tflite
+  face_landmarker: models/mediapipe/face_landmarker.task
+
+# Production embedding backbone. The project no longer supports
+# All matching/calibration values target IR-SE50.
+embedding:
+  backbone: irse50
+  model_version: irse50_v1
+  weights: models/irse50/irse50.pth
